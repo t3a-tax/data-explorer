@@ -1,8 +1,10 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 
 export default function Login() {
   const { signIn } = useAuth()
+  const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
@@ -13,8 +15,12 @@ export default function Login() {
     setError('')
     setLoading(true)
     const { error: err } = await signIn(email, password)
-    if (err) setError(err.message)
-    setLoading(false)
+    if (err) {
+      setError(err.message)
+      setLoading(false)
+    } else {
+      navigate('/')
+    }
   }
 
   return (
