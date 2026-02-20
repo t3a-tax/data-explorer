@@ -41,12 +41,19 @@ export default function MapView() {
   async function loadMapData() {
     setLoading(true)
     try {
-      // State-level aggregates
-      const { data: stateData } = await supabase.from('firms').select('state')
-      const counts = {}
-      stateData?.forEach(r => { counts[r.state] = (counts[r.state] || 0) + 1 })
+      // Run one COUNT query per state in parallel — avoids Supabase's 1000-row default limit
+      const states = Object.keys(STATE_CENTERS)
+      const counts = await Promise.all(
+        states.map(state =>
+          supabase
+            .from('firms')
+            .select('*', { count: 'exact', head: true })
+            .eq('state', state)
+            .then(({ count }) => ({ state, count: count || 0 }))
+        )
+      )
       setStateStats(
-        Object.entries(counts).map(([state, count]) => ({
+        counts.map(({ state, count }) => ({
           state,
           name: STATE_NAMES[state] || state,
           count,

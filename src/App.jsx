@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard'
 import Explorer from './pages/Explorer'
 import MapView from './pages/MapView'
 import DataCompleteness from './pages/DataCompleteness'
+import RawData from './pages/RawData'
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth()
@@ -71,6 +72,16 @@ export default function App() {
             <ProtectedRoute>
               <Layout>
                 <DataCompleteness />
+              </Layout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/raw-data"
+          element={
+            <ProtectedRoute>
+              <Layout>
+                <RawData />
               </Layout>
             </ProtectedRoute>
           }

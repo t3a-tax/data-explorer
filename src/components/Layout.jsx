@@ -5,6 +5,7 @@ const NAV_LINKS = [
   { to: '/', label: 'Dashboard' },
   { to: '/explorer', label: 'Firm Explorer' },
   { to: '/map', label: 'Map View' },
+  { to: '/raw-data', label: 'Raw Data' },
   { to: '/completeness', label: 'Data Completeness' },
 ]
 
