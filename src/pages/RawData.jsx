@@ -36,6 +36,12 @@ const SOURCES = [
     columns: ['firm_name', 'city', 'state', 'annual_revenue', 'asking_price', 'sale_status', 'broker_name', 'listing_notes', 'acquisition_tier', 'acquisition_score'],
   },
   {
+    key: 'accounting_practice_sales',
+    label: 'APS Listings',
+    description: '53 firms — live for-sale listings from accountingpracticesales.com',
+    columns: ['firm_name', 'state', 'annual_revenue', 'asking_price', 'sale_status', 'broker_name', 'credentials', 'acquisition_tier', 'acquisition_score'],
+  },
+  {
     key: 'secretary_of_state',
     label: 'Secretary of State',
     description: '3 firms — SC business entity registrations',
