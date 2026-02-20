@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabase'
+import * as XLSX from 'xlsx'
 
 const TEAL = '#1f514c'
 const PAGE_SIZE = 100
@@ -71,6 +72,12 @@ const COL_LABELS = {
   acquisition_score: 'Score',
 }
 
+// Columns that use numeric (gte) filtering instead of ilike
+const NUMERIC_COLS = new Set(['annual_revenue', 'asking_price', 'acquisition_score', 'google_rating', 'google_review_count'])
+
+// Columns that should not be sortable
+const UNSORTABLE_COLS = new Set(['listing_notes', 'full_address', 'credentials'])
+
 function formatValue(col, val) {
   if (val === null || val === undefined || val === '') return '—'
   if (col === 'annual_revenue' || col === 'asking_price') {
@@ -93,27 +100,6 @@ function formatValue(col, val) {
   return String(val)
 }
 
-function downloadCSV(data, columns, filename) {
-  const header = columns.map(c => COL_LABELS[c] || c).join(',')
-  const rows = data.map(row =>
-    columns.map(c => {
-      const v = row[c]
-      if (v === null || v === undefined) return ''
-      return `"${String(v).replace(/"/g, '""')}"`
-    }).join(',')
-  )
-  const csv = [header, ...rows].join('\n')
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
-}
-
 export default function RawData() {
   const [activeSource, setActiveSource] = useState(SOURCES[0])
   const [selectedState, setSelectedState] = useState('ALL')
@@ -122,8 +108,26 @@ export default function RawData() {
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [exportProgress, setExportProgress] = useState(null)
+  const [sortCol, setSortCol] = useState('acquisition_score')
+  const [sortDir, setSortDir] = useState('desc')
+  const [filters, setFilters] = useState({})
+  const filterTimers = useRef({})
 
-  const fetchData = useCallback(async (src, state, pg) => {
+  const applyFilters = (q, filt) => {
+    for (const [col, val] of Object.entries(filt)) {
+      if (val === '' || val === null || val === undefined) continue
+      if (NUMERIC_COLS.has(col)) {
+        const num = parseFloat(val)
+        if (!isNaN(num)) q = q.gte(col, num)
+      } else {
+        q = q.ilike(col, `%${val}%`)
+      }
+    }
+    return q
+  }
+
+  const fetchData = useCallback(async (src, state, pg, sCol, sDir, filt) => {
     setLoading(true)
     try {
       let q = supabase
@@ -131,9 +135,10 @@ export default function RawData() {
         .select(src.columns.join(','), { count: 'exact' })
         .or(`sources.ilike.%${src.key}%`)
         .range(pg * PAGE_SIZE, (pg + 1) * PAGE_SIZE - 1)
-        .order('acquisition_score', { ascending: false })
+        .order(sCol, { ascending: sDir === 'asc' })
 
       if (state !== 'ALL') q = q.eq('state', state)
+      q = applyFilters(q, filt)
 
       const { data, count, error } = await q
       if (error) throw error
@@ -146,35 +151,94 @@ export default function RawData() {
     }
   }, [])
 
+  // Reset everything when source or state changes
   useEffect(() => {
+    const newSort = 'acquisition_score'
+    const newDir = 'desc'
+    const newFilters = {}
     setPage(0)
-    fetchData(activeSource, selectedState, 0)
+    setSortCol(newSort)
+    setSortDir(newDir)
+    setFilters(newFilters)
+    fetchData(activeSource, selectedState, 0, newSort, newDir, newFilters)
   }, [activeSource, selectedState])
+
+  const handleSort = (col) => {
+    if (UNSORTABLE_COLS.has(col)) return
+    const newDir = sortCol === col && sortDir === 'asc' ? 'desc' : 'asc'
+    setSortCol(col)
+    setSortDir(newDir)
+    setPage(0)
+    fetchData(activeSource, selectedState, 0, col, newDir, filters)
+  }
+
+  const handleFilter = (col, val) => {
+    const newFilters = { ...filters, [col]: val }
+    setFilters(newFilters)
+    clearTimeout(filterTimers.current[col])
+    filterTimers.current[col] = setTimeout(() => {
+      setPage(0)
+      fetchData(activeSource, selectedState, 0, sortCol, sortDir, newFilters)
+    }, 400)
+  }
+
+  const handlePageChange = (newPage) => {
+    setPage(newPage)
+    fetchData(activeSource, selectedState, newPage, sortCol, sortDir, filters)
+  }
 
   const handleExport = async () => {
     setExporting(true)
+    setExportProgress('Fetching rows…')
     try {
-      // Fetch up to 10,000 rows for export
-      let q = supabase
-        .from('firms')
-        .select(activeSource.columns.join(','))
-        .or(`sources.ilike.%${activeSource.key}%`)
-        .order('acquisition_score', { ascending: false })
-        .limit(10000)
+      const allRows = []
+      let pg = 0
+      const batchSize = 1000
 
-      if (selectedState !== 'ALL') q = q.eq('state', selectedState)
+      while (true) {
+        let q = supabase
+          .from('firms')
+          .select('*')
+          .or(`sources.ilike.%${activeSource.key}%`)
+          .order(sortCol, { ascending: sortDir === 'asc' })
+          .range(pg * batchSize, (pg + 1) * batchSize - 1)
 
-      const { data } = await q
-      if (data) {
-        const stateSuffix = selectedState !== 'ALL' ? `_${selectedState}` : ''
-        downloadCSV(data, activeSource.columns, `t3a_${activeSource.key}${stateSuffix}.csv`)
+        if (selectedState !== 'ALL') q = q.eq('state', selectedState)
+        q = applyFilters(q, filters)
+
+        const { data, error } = await q
+        if (error) throw error
+        if (!data || data.length === 0) break
+        allRows.push(...data)
+        setExportProgress(`Fetched ${allRows.length.toLocaleString()} rows…`)
+        if (data.length < batchSize) break
+        pg++
       }
+
+      setExportProgress('Building Excel file…')
+
+      const ws = XLSX.utils.json_to_sheet(allRows)
+      const wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, ws, activeSource.label.slice(0, 31))
+      const stateSuffix = selectedState !== 'ALL' ? `_${selectedState}` : ''
+      XLSX.writeFile(wb, `t3a_${activeSource.key}${stateSuffix}.xlsx`)
+    } catch (err) {
+      console.error(err)
     } finally {
       setExporting(false)
+      setExportProgress(null)
     }
   }
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
+
+  const sortIndicator = (col) => {
+    if (UNSORTABLE_COLS.has(col)) return null
+    if (sortCol !== col) return <span style={{ color: 'rgba(99,99,99,0.35)', marginLeft: 4 }}>↕</span>
+    return <span style={{ color: TEAL, marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>
+  }
+
+  const activeFiltersCount = Object.values(filters).filter(v => v && v !== '').length
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -228,7 +292,27 @@ export default function RawData() {
             {activeSource.description}
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Active filters badge */}
+          {activeFiltersCount > 0 && (
+            <button
+              onClick={() => {
+                const cleared = {}
+                setFilters(cleared)
+                setPage(0)
+                fetchData(activeSource, selectedState, 0, sortCol, sortDir, cleared)
+              }}
+              style={{
+                height: 38, background: 'rgba(255,255,255,0.15)', color: 'white',
+                border: '1px solid rgba(255,255,255,0.4)', borderRadius: 10,
+                padding: '0 14px', fontSize: 13, cursor: 'pointer',
+                fontFamily: '"Inter", sans-serif',
+              }}
+            >
+              {activeFiltersCount} filter{activeFiltersCount > 1 ? 's' : ''} active · clear
+            </button>
+          )}
+
           {/* State filter */}
           <select
             value={selectedState}
@@ -255,16 +339,20 @@ export default function RawData() {
               border: 'none', borderRadius: 10, padding: '0 18px',
               fontSize: 13, fontWeight: 600, cursor: exporting ? 'wait' : 'pointer',
               fontFamily: '"Inter", sans-serif', opacity: total === 0 ? 0.5 : 1,
+              whiteSpace: 'nowrap',
             }}
           >
-            {exporting ? 'Exporting…' : `↓ Export CSV`}
+            {exporting ? (exportProgress || 'Exporting…') : `↓ Export Excel`}
           </button>
         </div>
       </div>
 
       {/* Row count */}
       <div style={{ fontSize: 13, color: '#636363' }}>
-        {loading ? 'Loading…' : `${total.toLocaleString()} rows ${selectedState !== 'ALL' ? `in ${selectedState}` : 'across all states'} · showing ${page * PAGE_SIZE + 1}–${Math.min((page + 1) * PAGE_SIZE, total).toLocaleString()}`}
+        {loading
+          ? 'Loading…'
+          : `${total.toLocaleString()} rows ${selectedState !== 'ALL' ? `in ${selectedState}` : 'across all states'}${activeFiltersCount > 0 ? ' (filtered)' : ''} · showing ${total === 0 ? 0 : page * PAGE_SIZE + 1}–${Math.min((page + 1) * PAGE_SIZE, total).toLocaleString()}`
+        }
       </div>
 
       {/* Table */}
@@ -276,14 +364,45 @@ export default function RawData() {
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
-              <tr style={{ background: '#f8fafa', borderBottom: '1px solid #f0f0f0' }}>
+              {/* Column header row — sortable */}
+              <tr style={{ background: '#f8fafa', borderBottom: '1px solid #ececec' }}>
+                {activeSource.columns.map(col => {
+                  const sortable = !UNSORTABLE_COLS.has(col)
+                  return (
+                    <th key={col}
+                      onClick={() => sortable && handleSort(col)}
+                      style={{
+                        padding: '12px 16px', textAlign: 'left', fontSize: 11,
+                        fontWeight: 700, color: sortable ? '#444' : '#636363',
+                        textTransform: 'uppercase', letterSpacing: '0.06em',
+                        whiteSpace: 'nowrap', userSelect: 'none',
+                        cursor: sortable ? 'pointer' : 'default',
+                      }}
+                    >
+                      {COL_LABELS[col] || col}
+                      {sortIndicator(col)}
+                    </th>
+                  )
+                })}
+              </tr>
+              {/* Filter input row */}
+              <tr style={{ background: '#fcfcfc', borderBottom: '2px solid #e8e8e8' }}>
                 {activeSource.columns.map(col => (
-                  <th key={col} style={{
-                    padding: '12px 16px', textAlign: 'left', fontSize: 11,
-                    fontWeight: 700, color: '#636363', textTransform: 'uppercase',
-                    letterSpacing: '0.06em', whiteSpace: 'nowrap',
-                  }}>
-                    {COL_LABELS[col] || col}
+                  <th key={col} style={{ padding: '6px 10px' }}>
+                    <input
+                      type={NUMERIC_COLS.has(col) ? 'number' : 'text'}
+                      value={filters[col] || ''}
+                      onChange={e => handleFilter(col, e.target.value)}
+                      placeholder={NUMERIC_COLS.has(col) ? 'min' : 'filter…'}
+                      style={{
+                        width: '100%', minWidth: col === 'firm_name' ? 120 : col === 'state' ? 40 : 60,
+                        padding: '5px 8px', fontSize: 12,
+                        border: filters[col] ? `1px solid ${TEAL}` : '1px solid #e0e0e0',
+                        borderRadius: 6, outline: 'none', fontFamily: '"Inter", sans-serif',
+                        background: filters[col] ? '#f0f8f7' : 'white',
+                        color: '#141414', boxSizing: 'border-box',
+                      }}
+                    />
                   </th>
                 ))}
               </tr>
@@ -307,7 +426,7 @@ export default function RawData() {
                     <td key={col} style={{
                       padding: '10px 16px', color: '#141414',
                       maxWidth: col === 'listing_notes' ? 240 : col === 'firm_name' ? 220 : 'auto',
-                      whiteSpace: col === 'listing_notes' || col === 'firm_name' ? 'nowrap' : 'nowrap',
+                      whiteSpace: 'nowrap',
                       overflow: 'hidden', textOverflow: 'ellipsis',
                     }}>
                       {formatValue(col, row[col])}
@@ -323,23 +442,23 @@ export default function RawData() {
       {/* Pagination */}
       {totalPages > 1 && (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
-          <button onClick={() => { setPage(0); fetchData(activeSource, selectedState, 0) }}
+          <button onClick={() => handlePageChange(0)}
             disabled={page === 0} style={pgBtn(page === 0)}>«</button>
-          <button onClick={() => { const p = page - 1; setPage(p); fetchData(activeSource, selectedState, p) }}
+          <button onClick={() => handlePageChange(page - 1)}
             disabled={page === 0} style={pgBtn(page === 0)}>‹ Prev</button>
           <span style={{ fontSize: 13, color: '#636363', padding: '0 8px' }}>
             Page {page + 1} of {totalPages.toLocaleString()}
           </span>
-          <button onClick={() => { const p = page + 1; setPage(p); fetchData(activeSource, selectedState, p) }}
+          <button onClick={() => handlePageChange(page + 1)}
             disabled={page >= totalPages - 1} style={pgBtn(page >= totalPages - 1)}>Next ›</button>
-          <button onClick={() => { const p = totalPages - 1; setPage(p); fetchData(activeSource, selectedState, p) }}
+          <button onClick={() => handlePageChange(totalPages - 1)}
             disabled={page >= totalPages - 1} style={pgBtn(page >= totalPages - 1)}>»</button>
         </div>
       )}
 
       {/* Export note */}
       <div style={{ background: '#f0f8f0', borderRadius: 12, padding: '12px 16px', fontSize: 12, color: '#2a6b64' }}>
-        <strong>Export note:</strong> CSV exports up to 10,000 rows for the selected source and state filter. Open in Excel or Google Sheets. For full dataset exports, run the upload_data.py script and query Supabase directly.
+        <strong>Export note:</strong> Excel exports all rows and all columns for the selected source and active filters. Any column filters and state selection applied above are reflected in the export.
       </div>
     </div>
   )
